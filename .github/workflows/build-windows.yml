@@ -1,59 +1,87 @@
 name: Build Windows demo
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'lib/**'
-      - 'pubspec.yaml'
-      - '.github/workflows/build-windows.yml'
   workflow_dispatch:
-
-permissions:
-  contents: read
+  push:
+    paths:
+      - 'flutter_app/**'
+      - '.github/workflows/build-windows.yml'
 
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          cache: true
 
-      - name: Create Windows Flutter project
-        shell: pwsh
-        run: flutter create --platforms=windows --project-name spieder_vpn "$env:RUNNER_TEMP\spieder_vpn"
+      - name: Generate Windows platform files
+        working-directory: flutter_app
+        run: flutter create --platforms=windows .
 
-      - name: Copy app files
-        shell: pwsh
-        run: |
-          $project = "$env:RUNNER_TEMP\spieder_vpn"
-          Copy-Item "$env:GITHUB_WORKSPACE\pubspec.yaml" "$project\pubspec.yaml" -Force
-          Remove-Item "$project\lib" -Recurse -Force
-          Copy-Item "$env:GITHUB_WORKSPACE\lib" "$project\lib" -Recurse
-
-      - name: Build Windows release
+      - name: Configure frameless window and black native background
+        working-directory: flutter_app
         shell: pwsh
         run: |
-          $project = "$env:RUNNER_TEMP\spieder_vpn"
-          Set-Location $project
-          flutter pub get
-          flutter build windows --release
+          $mainPath = "windows/runner/main.cpp"
+          $main = Get-Content $mainPath -Raw
 
-      - name: Package Windows app
-        shell: pwsh
-        run: |
-          $release = "$env:RUNNER_TEMP\spieder_vpn\build\windows\x64\runner\Release"
-          Compress-Archive -Path "$release\*" -DestinationPath "$env:GITHUB_WORKSPACE\SpiederVPN-Windows.zip" -Force
+          $main = [regex]::Replace(
+            $main,
+            'Win32Window::Point origin\([^;]*\);',
+            'Win32Window::Point origin((GetSystemMetrics(SM_CXSCREEN) - 440) / 2, (GetSystemMetrics(SM_CYSCREEN) - 820) / 2);'
+          )
+          $main = [regex]::Replace(
+            $main,
+            'Win32Window::Size size\([^;]*\);',
+            'Win32Window::Size size(440, 820);'
+          )
 
-      - name: Upload Windows app
+          if ($main -notmatch 'Win32Window::Size size\(440, 820\);') {
+            throw "Could not set the window size in $mainPath"
+          }
+
+          Set-Content -Path $mainPath -Value $main -NoNewline
+
+          $windowPath = "windows/runner/win32_window.cpp"
+          $window = Get-Content $windowPath -Raw
+
+          if ($window -notmatch 'WS_OVERLAPPEDWINDOW') {
+            throw "Could not find the default window style in $windowPath"
+          }
+
+          $window = $window.Replace('WS_OVERLAPPEDWINDOW', 'WS_POPUP')
+
+          $backgroundPattern = '(?m)(\w+\.hbrBackground\s*=\s*)[^;]*;'
+          if ($window -notmatch $backgroundPattern) {
+            throw "Could not find the native window background in $windowPath"
+          }
+
+          $window = [regex]::Replace(
+            $window,
+            $backgroundPattern,
+            '${1}CreateSolidBrush(RGB(0, 0, 0));',
+            1
+          )
+
+          Set-Content -Path $windowPath -Value $window -NoNewline
+
+      - name: Install dependencies
+        working-directory: flutter_app
+        run: flutter pub get
+
+      - name: Build Windows app
+        working-directory: flutter_app
+        run: flutter build windows --release
+
+      - name: Upload Windows build
         uses: actions/upload-artifact@v4
         with:
-          name: SpiederVPN-Windows
-          path: SpiederVPN-Windows.zip
-          retention-days: 30
+          name: SpiderVPN-Windows-Demo
+          path: flutter_app/build/windows/x64/runner/Release/
+          if-no-files-found: error
